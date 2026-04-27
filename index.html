@@ -12,6 +12,13 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<!-- Firebase Realtime Database SDK -->
+<script type="module">
+import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js';
+import { getDatabase, ref, set, push, onValue, get, off } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js';
+window._fbSDK = { initializeApp, getDatabase, ref, set, push, onValue, get, off };
+window.dispatchEvent(new Event('fbSDKReady'));
+</script>
 <style>
   :root {
     --ink-900: #1a1a1a;
@@ -1270,6 +1277,34 @@
         <input type="text" id="endpoint" value="https://api.siliconflow.cn/v1/chat/completions">
       </div>
       <button class="btn ghost" onclick="testConnection()"><span data-i18n="test-connect">测试连接</span></button>
+    </div>
+
+    <!-- Firebase 配置区 -->
+    <div style="margin-top:18px; padding:16px 18px; background:var(--ink-50); border:1px solid var(--ink-200); border-left:3px solid var(--accent);">
+      <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:10px;">
+        <span style="font-family:var(--serif); font-style:italic; font-size:15px; color:var(--ink-700);">Firebase 实时同步配置 <span style="font-family:var(--hans); font-style:normal; font-size:11px; color:var(--ink-400);">· 扫码收集必须启用</span></span>
+        <span id="fb-status-badge" style="font-family:var(--mono); font-size:10px; color:var(--ink-400); letter-spacing:0.1em;">● 未连接</span>
+      </div>
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:10px;">
+        <div class="field">
+          <label>Firebase Project ID</label>
+          <input type="text" id="fb-project-id" placeholder="my-survey-12345" autocomplete="off">
+        </div>
+        <div class="field">
+          <label>Database URL</label>
+          <input type="text" id="fb-db-url" placeholder="https://my-survey-12345-default-rtdb.firebaseio.com" autocomplete="off">
+        </div>
+        <div class="field">
+          <label>API Key</label>
+          <input type="text" id="fb-api-key" placeholder="AIzaSy..." autocomplete="off">
+        </div>
+        <div class="field" style="align-self:end;">
+          <button class="btn" onclick="connectFirebase()" style="width:100%;">🔗 连接 Firebase</button>
+        </div>
+      </div>
+      <div style="font-family:var(--mono); font-size:10px; color:var(--ink-400); line-height:1.6;">
+        ① 访问 <a href="https://console.firebase.google.com" target="_blank" style="color:var(--accent);">console.firebase.google.com</a> → 创建项目（免费）→ 添加 Web App → 在 Realtime Database 新建数据库 → 将规则设为 <code>".read":true, ".write":true</code>（测试模式）→ 把 projectId、databaseURL、apiKey 填入上方。
+      </div>
     </div>
 
     <div class="ingest-grid">
@@ -2733,9 +2768,25 @@ function submitRespondentForm(questions) {
   }
   if (!valid) return;
 
-  // Build response URL and redirect to analysis page
+  // Build response URL
   const respURL = buildResponseURL(row);
-  window.location.href = respURL;
+  _respRespURL = respURL;
+  $('resp-resp-url').textContent = respURL;
+
+  // Generate response QR
+  const qrDiv = $('resp-thanks-qr');
+  qrDiv.innerHTML = '';
+  if (typeof QRCode !== 'undefined') {
+    try {
+      new QRCode(qrDiv, { text: respURL, width: 180, height: 180,
+        colorDark: '#1a1a1a', colorLight: '#ffffff',
+        correctLevel: QRCode.CorrectLevel.M });
+    } catch(_) {}
+  }
+
+  // Show thanks screen
+  $('resp-form-body').style.display = 'none';
+  $('resp-thanks').style.display = 'flex';
 }
 
 /* Teacher side: import a response URL */
@@ -2813,82 +2864,366 @@ renderManualBuilder();
 // Restore saved live survey questions
 if (!loadLiveState() && state.liveQuestions.length === 0) { /* will add on first switchMode */ }
 
-function startLiveCollect() {
-  if (state.liveQuestions.length === 0) {
-    toast('请至少添加一个题目', 'error');
-    return;
-  }
-  saveLiveState();
-  const livePhase = $('live-collect-phase');
-  const designPhase = $('live-design-phase');
-  livePhase.classList.remove('hidden');
-  designPhase.classList.add('hidden');
-  renderLiveForm();
+/* ============================================================
+ *  Firebase 实时同步系统 (v2 — 短URL修复版)
+ * ============================================================ */
+let _db = null;
+let _surveyId = null;
+let _respUnsubscribe = null;
+let _autoAnalyzeDone = false;
+
+/* 等待 Firebase SDK 加载完毕 */
+function _withSDK(fn) {
+  if (window._fbSDK && window._fbSDK.initializeApp) { fn(window._fbSDK); return; }
+  window.addEventListener('fbSDKReady', () => fn(window._fbSDK), { once: true });
 }
 
-async function showQRModal() {
-  const overlay = $('qr-modal-overlay');
-  const rawURL = window.location.href.split('#')[0];
-  const isLocal = rawURL.startsWith('file://');
-
-  // Build the actual target URL (with questions encoded if available)
-  let targetURL = rawURL;
-  if (state.liveQuestions && state.liveQuestions.length > 0) {
-    targetURL = buildRespondentURL();
+/* ---- 极限压缩 Firebase 配置，用于 QR 码 ---- */
+/* 
+ * 策略：Firebase databaseURL 和 projectId 高度冗余，
+ * 例如 projectId = "my-survey-123", databaseURL = "https://my-survey-123-default-rtdb.firebaseio.com"
+ * 我们只需传 projectId + apiKey，databaseURL 可从 projectId 推导出来。
+ * 如果用户的 databaseURL 不符合默认规则（如自定义区域），则传一个 region 标记。
+ */
+function _compressFbCfg(projectId, dbURL, apiKey) {
+  // 检测是否为默认 databaseURL 格式
+  const defaultURL = `https://${projectId}-default-rtdb.firebaseio.com`;
+  const asiaURL = `https://${projectId}-default-rtdb.asia-southeast1.firebasedatabase.app`;
+  const europeURL = `https://${projectId}-default-rtdb.europe-west1.firebasedatabase.app`;
+  
+  let regionFlag = 'x'; // x = 需要传完整URL
+  if (dbURL === defaultURL || dbURL === defaultURL + '/') regionFlag = '0';
+  else if (dbURL === asiaURL || dbURL === asiaURL + '/') regionFlag = 'a';
+  else if (dbURL === europeURL || dbURL === europeURL + '/') regionFlag = 'e';
+  
+  if (regionFlag === 'x') {
+    // 无法压缩，传完整但去掉 https:// 前缀
+    return regionFlag + '|' + projectId + '|' + apiKey + '|' + dbURL.replace('https://', '');
   }
+  return regionFlag + '|' + projectId + '|' + apiKey;
+}
 
-  overlay.classList.remove('hidden');
+function _decompressFbCfg(str) {
+  const parts = str.split('|');
+  if (parts.length < 3) return null;
+  const [regionFlag, projectId, apiKey, rawURL] = parts;
+  let dbURL;
+  if (regionFlag === '0') dbURL = `https://${projectId}-default-rtdb.firebaseio.com`;
+  else if (regionFlag === 'a') dbURL = `https://${projectId}-default-rtdb.asia-southeast1.firebasedatabase.app`;
+  else if (regionFlag === 'e') dbURL = `https://${projectId}-default-rtdb.europe-west1.firebasedatabase.app`;
+  else if (regionFlag === 'x' && rawURL) dbURL = 'https://' + rawURL;
+  else return null;
+  return { projectId, apiKey, dbURL };
+}
 
-  if (!isLocal) {
-    /* ── 正常 HTTP/HTTPS 模式 ── */
-    $('qr-normal-section').classList.remove('hidden');
-    $('qr-local-section').classList.add('hidden');
-    $('qr-url').textContent = targetURL;
-    _makeQR($('qr-canvas'), targetURL);
-  } else {
-    /* ── 本地 file:// 模式 ── */
-    $('qr-normal-section').classList.add('hidden');
-    $('qr-local-section').classList.remove('hidden');
-    const lang = state.lang;
+/* 更短的 Base64 编码（使用 URL-safe Base64 避免 encodeURIComponent 膨胀） */
+function _urlSafeB64Enc(str) {
+  return btoa(unescape(encodeURIComponent(str)))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function _urlSafeB64Dec(str) {
+  let s = str.replace(/-/g, '+').replace(/_/g, '/');
+  while (s.length % 4) s += '=';
+  return decodeURIComponent(escape(atob(s)));
+}
 
-    _localFileName = fileNameFromURL(rawURL);
-    $('qr-cmd-text').textContent = 'python -m http.server 8000';
+function connectFirebase() {
+  const projectId = ($('fb-project-id')?.value || '').trim();
+  const dbURL     = ($('fb-db-url')?.value    || '').trim();
+  const apiKey    = ($('fb-api-key')?.value   || '').trim();
+  if (!projectId || !dbURL || !apiKey) {
+    toast('请填写全部 Firebase 配置', 'error'); return;
+  }
+  // Save to localStorage
+  try { localStorage.setItem('fb_cfg', JSON.stringify({projectId, dbURL, apiKey})); } catch(_) {}
 
-    const isZH = lang === 'zh';
-    $('qr-step1-text').textContent  = isZH ? '在此 HTML 文件所在目录运行：' : 'Run in the folder containing this HTML:';
-    $('qr-step2-text').textContent  = isZH ? '确保手机与电脑在同一 Wi-Fi，扫码访问：' : 'Make sure phone & PC are on the same Wi-Fi, then scan:';
-    $('qr-ip-label').textContent    = isZH ? '局域网 IP：' : 'LAN IP:';
-
-    const detecting = $('qr-ip-detecting');
-    const input     = $('qr-ip-input');
-    const warn      = $('qr-ip-warn');
-    input.value = '';
-    detecting.classList.remove('hidden');
-    rebuildLocalQR();
-
+  _withSDK(({ initializeApp, getDatabase }) => {
     try {
-      const ip = await detectLocalIP();
-      detecting.classList.add('hidden');
+      const app = initializeApp({ apiKey, projectId, databaseURL: dbURL }, 'survey_' + Date.now());
+      _db = getDatabase(app);
+      window._fbSDK._db = _db;
+      $('fb-status-badge').textContent = '● 已连接';
+      $('fb-status-badge').style.color = '#5a7a4f';
+      toast('✓ Firebase 连接成功！');
+    } catch(e) {
+      toast('Firebase 连接失败: ' + e.message, 'error');
+    }
+  });
+}
 
-      if (ip) {
-        input.value = ip;
-        warn.classList.add('hidden');
-      } else {
-        warn.classList.remove('hidden');
-        warn.innerHTML = isZH
-          ? '⚠ 未能自动探测到局域网 IP，请手动填写（如 192.168.1.5）。可在终端运行 <code>ipconfig</code>（Windows）或 <code>ifconfig</code>（Mac/Linux）查询。'
-          : '⚠ Could not auto-detect LAN IP. Enter it manually (e.g. 192.168.1.5). Run <code>ipconfig</code> (Win) or <code>ifconfig</code> (Mac/Linux) in terminal.';
+/* 恢复已保存的 Firebase 配置 */
+(function restoreFbCfg() {
+  try {
+    const cfg = JSON.parse(localStorage.getItem('fb_cfg') || 'null');
+    if (!cfg) return;
+    if ($('fb-project-id')) $('fb-project-id').value = cfg.projectId || '';
+    if ($('fb-db-url'))     $('fb-db-url').value     = cfg.dbURL     || '';
+    if ($('fb-api-key'))    $('fb-api-key').value     = cfg.apiKey    || '';
+  } catch(_) {}
+})();
+
+/* 生成6位随机调查码 */
+function _genSurveyCode() {
+  return Math.random().toString(36).substr(2, 6).toUpperCase();
+}
+
+/* 创建调查并开始监听 */
+async function _createFirebaseSurvey() {
+  if (!_db) return false;
+  const { ref, set } = window._fbSDK;
+  _surveyId = _genSurveyCode();
+  _autoAnalyzeDone = false;
+  try {
+    await set(ref(_db, `surveys/${_surveyId}/meta`), {
+      questions: state.liveQuestions,
+      createdAt: Date.now()
+    });
+    _listenForResponses(_surveyId);
+    // Show firebase bar
+    const bar = $('fb-survey-bar');
+    if (bar) { bar.style.display = 'flex'; }
+    const codeEl = $('fb-survey-code');
+    if (codeEl) codeEl.textContent = _surveyId;
+    return true;
+  } catch(e) {
+    toast('Firebase 创建调查失败: ' + e.message, 'error');
+    return false;
+  }
+}
+
+/* 监听实时回答 */
+function _listenForResponses(surveyId) {
+  if (!_db) return;
+  const { ref, onValue } = window._fbSDK;
+  if (_respUnsubscribe) { _respUnsubscribe(); _respUnsubscribe = null; }
+
+  const responsesRef = ref(_db, `surveys/${surveyId}/responses`);
+  _respUnsubscribe = onValue(responsesRef, (snapshot) => {
+    const data = snapshot.val();
+    if (!data) return;
+    const responses = Object.values(data);
+    state.rows = responses;
+    if (state.questions.length === 0 && responses.length > 0) {
+      state.questions = Object.keys(responses[0]);
+    }
+    const n = responses.length;
+    $('live-response-count').textContent = n;
+    $('fb-resp-live').textContent = n;
+    $('kpi-total').innerHTML = n + '<span class="unit">份</span>';
+    $('kpi-total-delta').textContent = `live · ${fmtTime()}`;
+    $('kpi-questions').innerHTML = (state.liveQuestions.length || Object.keys(responses[0]).length) + '<span class="unit">题</span>';
+    $('analyze-btn').disabled = false;
+    setStatus(`📡 实时同步中 · 已收集 ${n} 份答卷`);
+    toast(`✓ 新增回答！共 ${n} 份`);
+
+    // 自动分析
+    const threshold = parseInt($('auto-analyze-threshold')?.value) || 0;
+    if (!_autoAnalyzeDone && threshold > 0 && n >= threshold) {
+      _autoAnalyzeDone = true;
+      toast(`🤖 已达 ${threshold} 份，自动开始 AI 分析…`);
+      setTimeout(() => runAnalysis(), 800);
+    }
+  });
+}
+
+/* 学生端：提交回答到 Firebase */
+async function _submitToFirebase(surveyId, row) {
+  if (!_db) return false;
+  const { ref, push } = window._fbSDK;
+  await push(ref(_db, `surveys/${surveyId}/responses`), row);
+  return true;
+}
+
+/* 学生端：从 Firebase 拉取问题 */
+async function _fetchSurveyFromFirebase(surveyId) {
+  if (!_db) return null;
+  const { ref, get } = window._fbSDK;
+  const snap = await get(ref(_db, `surveys/${surveyId}/meta`));
+  return snap.val();
+}
+
+/* 学生模式：从 ?sid=XXXXX 加载 */
+async function _initStudentMode(surveyId, fbCfg) {
+  const body = $('resp-form-body');
+  if (body) body.innerHTML = '<p style="text-align:center;padding:40px;font-family:var(--hans);color:var(--ink-500);">⏳ 正在加载问卷…</p>';
+
+  _withSDK(async ({ initializeApp, getDatabase, ref, get, push }) => {
+    try {
+      const app = initializeApp(fbCfg, 'student_' + Date.now());
+      _db = getDatabase(app);
+      window._fbSDK._db = _db;
+
+      const survey = await _fetchSurveyFromFirebase(surveyId);
+      if (!survey || !survey.questions) {
+        if (body) body.innerHTML = '<p style="text-align:center;padding:40px;color:#8b1a1a;">问卷不存在或已过期，请重新扫码。</p>';
+        return;
       }
-      rebuildLocalQR();
-    } catch (e) {
-      detecting.classList.add('hidden');
-      warn.classList.remove('hidden');
-      warn.innerHTML = '⚠ IP 探测失败，请手动填写局域网 IP。';
-      rebuildLocalQR();
+      state.liveQuestions = survey.questions;
+      renderRespondentPage(survey.questions);
+      window._studentSurveyId = surveyId;
+    } catch(e) {
+      if (body) body.innerHTML = '<p style="text-align:center;padding:40px;color:#8b1a1a;">加载失败：' + e.message + '</p>';
+    }
+  });
+}
+
+/* 修改 startLiveCollect 以包含 Firebase 创建 */
+const _origStartLiveCollect = startLiveCollect;
+window.startLiveCollect = async function() {
+  if (!state.liveQuestions.every(q => q.text.trim())) {
+    toast('请填写所有题目内容', 'error'); return;
+  }
+  state.liveCollecting = true;
+  $('live-design-phase').classList.add('hidden');
+  $('live-collect-phase').classList.remove('hidden');
+  renderLiveForm();
+
+  if (_db) {
+    const ok = await _createFirebaseSurvey();
+    if (ok) toast(`✓ 调查已创建，码：${_surveyId}，可点击 QR 生成二维码`);
+  } else {
+    toast('⚠ Firebase 未连接，学生端扫码无法用，但本机填写仍可用', 'error');
+  }
+};
+
+/* ---- 修改 showQRModal：用极短 URL 生成二维码 ---- */
+const _origShowQRModal = showQRModal;
+window.showQRModal = async function() {
+  const overlay = $('qr-modal-overlay');
+  overlay.classList.remove('hidden');
+  const rawURL = window.location.href.split('?')[0].split('#')[0];
+
+  if (_surveyId && _db) {
+    const cfg = JSON.parse(localStorage.getItem('fb_cfg') || 'null');
+    if (cfg) {
+      // 压缩 Firebase 配置
+      const compressed = _compressFbCfg(cfg.projectId, cfg.dbURL, cfg.apiKey);
+      const fc = _urlSafeB64Enc(compressed);
+      const targetURL = rawURL + '?sid=' + _surveyId + '&fc=' + fc;
+
+      // 检查 URL 长度，QR Code Level L 最多约 2953 字节（数字模式更多，字母数字约 ~1800）
+      console.log('[QR] URL length:', targetURL.length, 'chars');
+
+      $('qr-normal-section').classList.remove('hidden');
+      $('qr-local-section').classList.add('hidden');
+      $('qr-url').textContent = targetURL;
+      
+      // 生成 QR 码，使用 Level L 获得最大容量
+      const qrContainer = $('qr-canvas');
+      qrContainer.innerHTML = '';
+      try {
+        new QRCode(qrContainer, {
+          text: targetURL,
+          width: 220,
+          height: 220,
+          colorDark: '#1a1a1a',
+          colorLight: '#ffffff',
+          correctLevel: QRCode.CorrectLevel.L  // L级容错=最大数据容量
+        });
+        // 显示 URL 长度提示
+        if (targetURL.length > 500) {
+          toast(`⚠ 二维码数据较多(${targetURL.length}字符)，请确保扫码时画面清晰`, 'error');
+        }
+      } catch(e) {
+        qrContainer.innerHTML = `<p style="font-family:var(--mono);font-size:11px;color:#8b1a1a;padding:20px;">QR 生成失败：URL过长(${targetURL.length}字符)。<br>请尝试使用更短的 Firebase Project ID。</p>`;
+      }
+      return;
     }
   }
-}
 
+  // 回退到原有逻辑
+  await _origShowQRModal.call(this);
+};
+
+/* 修改 submitRespondentForm 以提交到 Firebase */
+const _origSubmitRespondentForm = submitRespondentForm;
+window.submitRespondentForm = async function(questions) {
+  const row = {};
+  const isZH = (navigator.language || '').startsWith('zh');
+  for (let i = 0; i < questions.length; i++) {
+    const q = questions[i];
+    let val = '';
+    if (q.type === 'text') {
+      val = ($('rf-' + q.id)?.value || '').trim();
+    } else if (q.type === 'radio') {
+      const checked = document.querySelector(`input[name="rf-${q.id}"]:checked`);
+      val = checked ? checked.value : '';
+    } else if (q.type === 'scale') {
+      const sel = document.querySelector(`.resp-scale-btn[data-qid="${q.id}"].sel`);
+      val = sel ? sel.dataset.val : '';
+    }
+    if (!val) {
+      alert(isZH ? `第 ${i+1} 题还没有填写，请完成后再提交。` : `Please answer question ${i+1}.`);
+      return;
+    }
+    row[q.text] = val;
+  }
+
+  const sid = window._studentSurveyId;
+  if (sid && _db) {
+    // Firebase 模式：直接上传
+    try {
+      await _submitToFirebase(sid, row);
+      $('resp-form-body').style.display = 'none';
+      $('resp-thanks').style.display = 'flex';
+      $('resp-thanks-sub').textContent = isZH
+        ? '✓ 您的回答已上传！老师端将自动收到。'
+        : '✓ Your response has been submitted! The teacher will see it automatically.';
+      $('resp-resp-url').textContent = '';
+      $('resp-thanks-qr').innerHTML = '';
+    } catch(e) {
+      alert('提交失败：' + e.message);
+    }
+  } else {
+    // 回退到原来的链接模式
+    _origSubmitRespondentForm(questions);
+  }
+};
+
+/* 检测 URL 参数中的 ?sid 学生模式 (v2 — 支持新压缩格式) */
+(function checkSidMode() {
+  const params = new URLSearchParams(window.location.search);
+  const sid = params.get('sid');
+  const fcParam = params.get('fc');
+  if (!sid) return;
+
+  // 学生模式
+  document.body.classList.add('resp-mode');
+  $('resp-page').style.display = 'flex';
+  $('resp-page').style.flexDirection = 'column';
+
+  if (!fcParam) {
+    const body = $('resp-form-body');
+    if (body) body.innerHTML = '<p style="text-align:center;padding:40px;color:#8b1a1a;">缺少配置信息，请联系老师重新生成二维码。</p>';
+    return;
+  }
+
+  // 尝试新格式（URL-safe Base64 压缩）
+  let cfg = null;
+  try {
+    const decoded = _urlSafeB64Dec(fcParam);
+    cfg = _decompressFbCfg(decoded);
+  } catch(e) {}
+
+  // 兼容旧格式（普通 Base64 JSON）
+  if (!cfg) {
+    try {
+      const oldDecoded = _b64dec(decodeURIComponent(fcParam));
+      if (oldDecoded && oldDecoded.p) {
+        cfg = { projectId: oldDecoded.p, dbURL: oldDecoded.d, apiKey: oldDecoded.k };
+      }
+    } catch(e) {}
+  }
+
+  if (!cfg) {
+    const body = $('resp-form-body');
+    if (body) body.innerHTML = '<p style="text-align:center;padding:40px;color:#8b1a1a;">配置信息解析失败，请联系老师重新生成二维码。</p>';
+    return;
+  }
+
+  _initStudentMode(sid, { apiKey: cfg.apiKey, projectId: cfg.projectId, databaseURL: cfg.dbURL });
+  window._studentSurveyId = sid;
+})();
 </script>
 </body>
 </html>
