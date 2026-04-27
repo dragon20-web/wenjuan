@@ -2720,25 +2720,9 @@ function submitRespondentForm(questions) {
   }
   if (!valid) return;
 
-  // Build response URL
+  // Build response URL and redirect to analysis page
   const respURL = buildResponseURL(row);
-  _respRespURL = respURL;
-  $('resp-resp-url').textContent = respURL;
-
-  // Generate response QR
-  const qrDiv = $('resp-thanks-qr');
-  qrDiv.innerHTML = '';
-  if (typeof QRCode !== 'undefined') {
-    try {
-      new QRCode(qrDiv, { text: respURL, width: 180, height: 180,
-        colorDark: '#1a1a1a', colorLight: '#ffffff',
-        correctLevel: QRCode.CorrectLevel.M });
-    } catch(_) {}
-  }
-
-  // Show thanks screen
-  $('resp-form-body').style.display = 'none';
-  $('resp-thanks').style.display = 'flex';
+  window.location.href = respURL;
 }
 
 /* Teacher side: import a response URL */
@@ -2767,6 +2751,12 @@ function importResponseURL() {
   $('analyze-btn').disabled = false;
   setStatus(`✓ 已导入，共 ${state.rows.length} 份答卷`);
   toast(`✓ 已导入 1 份回答，合计 ${state.rows.length} 份`);
+  
+  // Auto run analysis if API key is provided
+  const apiKey = $('api-key').value.trim();
+  if (apiKey) {
+    setTimeout(() => runAnalysis(), 800);
+  }
 }
 
 /* On page load: detect URL params */
@@ -2800,6 +2790,13 @@ function importResponseURL() {
         $('analyze-btn').disabled = false;
         setStatus(`✓ 已自动导入 1 份回答`);
         toast('✓ 已从链接导入 1 份回答');
+        
+        // Auto run analysis if API key is provided
+        const apiKey = $('api-key').value.trim();
+        if (apiKey) {
+          setTimeout(() => runAnalysis(), 800);
+        }
+        
         // Clean URL
         history.replaceState({}, '', window.location.pathname);
       }, 600);
